@@ -21,6 +21,7 @@ type Tone = "professional" | "casual" | "enthusiastic" | "authoritative";
 type Length = "short" | "medium" | "long";
 
 const API_URL = "https://solas-c81d5219.base44.app/functions/aiGenerate";
+const IMAGE_API_URL = "https://solas-c81d5219.base44.app/functions/aiImage";
 
 const contentTypeLabels: Record<ContentType, string> = {
   blog: "Blog Post",
@@ -251,8 +252,13 @@ export default function App() {
           />
         )}
 
+        {/* ─── Image Library ─── */}
+        {view === "images" && (
+          <ImageLibraryView showToast={showToast} />
+        )}
+
         {/* ─── Placeholder views ─── */}
-        {["templates", "rewrite", "seo", "images", "brand-voice", "integrations", "settings"].includes(view) && (
+        {["templates", "rewrite", "seo", "brand-voice", "integrations", "settings"].includes(view) && (
           <div className="placeholder-panel" style={{ margin: "2rem", padding: "3rem" }}>
             <h2 style={{ textTransform: "capitalize" }}>{view.replace("-", " ")}</h2>
             <p>This section is coming soon. Use the AI Writer or New Project button to start creating content.</p>
@@ -607,6 +613,9 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
   const [saved, setSaved] = useState(true);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [imagePrompt, setImagePrompt] = useState("");
+  const [imageLoading, setImageLoading] = useState(false);
+  const [generatedImages, setGeneratedImages] = useState<{ prompt: string; url: string }[]>([]);
 
   // Auto-save
   useEffect(() => {
@@ -633,7 +642,7 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
       const res = await fetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: userMsg, topic: project.topic, type: project.type, tone: project.tone, length: "medium" }),
+        body: JSON.stringify({ prompt: userMsg, topic: project.topic, type: project.type, tone: project.tone, length: "medium", mode: "chat" }),
       });
       const data = await res.json();
       if (data.success) {
@@ -652,6 +661,37 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
     const cleaned = text.replace(/^#\s+.+\n/, "").trim();
     setContent((prev) => prev + "\n\n" + cleaned);
     showToast("Content inserted into editor");
+  };
+
+  const handleGenerateImage = async () => {
+    if (!imagePrompt.trim() || imageLoading) return;
+    const prompt = imagePrompt.trim();
+    setImagePrompt("");
+    setImageLoading(true);
+    try {
+      const res = await fetch(IMAGE_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setGeneratedImages((prev) => [{ prompt, url: data.image }, ...prev]);
+        showToast("Image generated! ✨");
+      } else {
+        showToast(data.error || "Image generation failed");
+      }
+    } catch {
+      showToast("Network error generating image");
+    } finally {
+      setImageLoading(false);
+    }
+  };
+
+  const insertImage = (url: string, alt: string) => {
+    const md = `\n\n![${alt}](${url})\n`;
+    setContent((prev) => prev + md);
+    showToast("Image inserted into editor");
   };
 
   const applyFormat = (format: string) => {
@@ -898,9 +938,53 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
               </div>
             </div>
           ) : imageTab === "AI Images" ? (
-            <div style={{ padding: "1.5rem", textAlign: "center" }}>
-              <SparklesIcon />
-              <p style={{ color: "var(--muted-fg)", fontSize: ".85rem", marginTop: ".5rem" }}>AI image generation is coming soon. For now, use the AI Chat to generate text content.</p>
+            <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "1rem" }}>
+              <div style={{ display: "flex", gap: ".5rem", marginBottom: ".75rem" }}>
+                <input
+                  type="text"
+                  value={imagePrompt}
+                  onChange={(e) => setImagePrompt(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleGenerateImage(); }}
+                  placeholder="Describe an image..."
+                  style={{
+                    flex: 1, padding: ".6rem .8rem", background: "var(--panel-bg)",
+                    border: "1px solid var(--border)", borderRadius: "8px",
+                    color: "var(--fg)", fontSize: ".85rem", outline: "none"
+                  }}
+                />
+                <button className="primary-action" style={{ padding: ".6rem .8rem" }} onClick={handleGenerateImage} disabled={imageLoading}>
+                  {imageLoading ? <SpinnerIcon /> : <ImageIcon />}
+                </button>
+              </div>
+              <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: ".75rem" }}>
+                {imageLoading && generatedImages.length === 0 && (
+                  <div style={{ textAlign: "center", padding: "2rem 1rem" }}>
+                    <SpinnerIcon />
+                    <p style={{ color: "var(--muted-fg)", fontSize: ".85rem", marginTop: ".5rem" }}>Generating image with FLUX AI...</p>
+                  </div>
+                )}
+                {generatedImages.length === 0 && !imageLoading && (
+                  <div style={{ textAlign: "center", padding: "2rem 1rem" }}>
+                    <ImageIcon />
+                    <p style={{ color: "var(--muted-fg)", fontSize: ".85rem", marginTop: ".5rem" }}>Describe an image and generate it with FLUX AI.</p>
+                  </div>
+                )}
+                {generatedImages.map((img, i) => (
+                  <div key={i} style={{ borderRadius: "8px", overflow: "hidden", border: "1px solid var(--border)" }}>
+                    <img src={img.url} alt={img.prompt} style={{ width: "100%", display: "block" }} />
+                    <div style={{ padding: ".5rem .75rem", background: "var(--panel-bg)" }}>
+                      <p style={{ fontSize: ".75rem", color: "var(--muted-fg)", margin: "0 0 .4rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{img.prompt}</p>
+                      <button
+                        className="ai-msg-action"
+                        style={{ width: "100%", justifyContent: "center" }}
+                        onClick={() => insertImage(img.url, img.prompt)}
+                      >
+                        <PlusIcon /> Insert into editor
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           ) : (
             <div style={{ padding: "1.5rem", textAlign: "center" }}>
@@ -1066,6 +1150,143 @@ function NewProjectModal({ onClose, onCreate }: {
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─── Image Library View ────────────────────────────────
+function ImageLibraryView({ showToast }: { showToast: (msg: string) => void }) {
+  const [prompt, setPrompt] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [images, setImages] = useState<{ prompt: string; url: string }[]>(() => {
+    try {
+      const raw = sessionStorage.getItem("contentforge_images");
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem("contentforge_images", JSON.stringify(images.slice(0, 20)));
+    } catch { /* sessionStorage might be full with large base64 */ }
+  }, [images]);
+
+  const handleGenerate = async () => {
+    if (!prompt.trim() || loading) return;
+    const p = prompt.trim();
+    setPrompt("");
+    setLoading(true);
+    try {
+      const res = await fetch(IMAGE_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: p }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setImages((prev) => [{ prompt: p, url: data.image }, ...prev].slice(0, 20));
+        showToast("Image generated! ✨");
+      } else {
+        showToast(data.error || "Image generation failed");
+      }
+    } catch {
+      showToast("Network error generating image");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDownload = (url: string, prompt: string) => {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = prompt.replace(/[^a-z0-9]/gi, "-").toLowerCase().slice(0, 40) + ".png";
+    a.click();
+    showToast("Image downloaded");
+  };
+
+  const handleCopyPrompt = (text: string) => {
+    navigator.clipboard.writeText(text).then(() => showToast("Prompt copied"));
+  };
+
+  const handleDelete = (index: number) => {
+    setImages((prev) => prev.filter((_, i) => i !== index));
+    showToast("Image removed");
+  };
+
+  return (
+    <div style={{ padding: "2rem", maxWidth: "1100px", margin: "0 auto" }}>
+      <h1 style={{ fontSize: "1.75rem", fontWeight: 700, margin: "0 0 .5rem" }}>Image Library</h1>
+      <p style={{ color: "var(--muted-fg)", marginBottom: "2rem" }}>Generate stunning images with FLUX AI. Powered by Cloudflare Workers AI.</p>
+
+      {/* Prompt panel */}
+      <div className="panel" style={{ padding: "1.5rem", marginBottom: "1.5rem" }}>
+        <label style={{ display: "block", fontWeight: 600, marginBottom: ".5rem" }}>Image Prompt</label>
+        <div style={{ display: "flex", gap: ".75rem" }}>
+          <input
+            type="text"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") handleGenerate(); }}
+            placeholder="e.g. A serene mountain landscape at sunset, digital art style"
+            className="modal-input"
+            style={{ flex: 1 }}
+          />
+          <button className="primary-action" onClick={handleGenerate} disabled={loading} style={{ flexShrink: 0 }}>
+            {loading ? <><SpinnerIcon /><span>Generating...</span></> : <><ImageIcon /><span>Generate</span></>}
+          </button>
+        </div>
+        <p style={{ fontSize: ".8rem", color: "var(--muted-fg)", marginTop: ".75rem" }}>Tip: Be descriptive — include style, mood, lighting, and composition for best results.</p>
+      </div>
+
+      {/* Loading state */}
+      {loading && images.length === 0 && (
+        <div className="panel" style={{ padding: "3rem", textAlign: "center" }}>
+          <SpinnerIcon />
+          <p style={{ color: "var(--muted-fg)", marginTop: "1rem" }}>FLUX AI is creating your image...</p>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {images.length === 0 && !loading && (
+        <div className="empty-state">
+          <ImageIcon />
+          <p style={{ marginTop: ".5rem", fontSize: ".95rem" }}>No images yet. Generate your first AI image above!</p>
+        </div>
+      )}
+
+      {/* Image grid */}
+      {images.length > 0 && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: "1rem" }}>
+          {images.map((img, i) => (
+            <div key={i} className="panel" style={{ padding: 0, overflow: "hidden" }}>
+              <div style={{ position: "relative", background: "var(--panel-bg)" }}>
+                <img src={img.url} alt={img.prompt} style={{ width: "100%", display: "block" }} />
+                <button
+                  onClick={() => handleDelete(i)}
+                  aria-label="Delete image"
+                  style={{
+                    position: "absolute", top: ".5rem", right: ".5rem",
+                    background: "rgba(0,0,0,.6)", border: "none", borderRadius: "6px",
+                    padding: ".3rem .4rem", cursor: "pointer", color: "white",
+                    fontSize: ".75rem"
+                  }}
+                >✕</button>
+              </div>
+              <div style={{ padding: ".75rem 1rem" }}>
+                <p style={{ fontSize: ".8rem", color: "var(--muted-fg)", margin: "0 0 .5rem", lineHeight: 1.4, maxHeight: "2.8rem", overflow: "hidden" }}>{img.prompt}</p>
+                <div style={{ display: "flex", gap: ".5rem" }}>
+                  <button className="ghost-button" style={{ flex: 1, fontSize: ".8rem", padding: ".4rem" }} onClick={() => handleDownload(img.url, img.prompt)}>
+                    Download
+                  </button>
+                  <button className="ghost-button" style={{ flex: 1, fontSize: ".8rem", padding: ".4rem" }} onClick={() => handleCopyPrompt(img.prompt)}>
+                    Copy Prompt
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
