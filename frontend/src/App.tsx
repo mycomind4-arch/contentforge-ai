@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { marked } from "marked";
 
 // ─── Types ─────────────────────────────────────────────
 type View = "dashboard" | "projects" | "ai-writer" | "templates" | "rewrite" | "seo" | "images" | "brand-voice" | "integrations" | "settings" | "editor";
@@ -22,6 +23,7 @@ type Length = "short" | "medium" | "long";
 
 const API_URL = "https://solas-c81d5219.base44.app/functions/aiGenerate";
 const IMAGE_API_URL = "https://solas-c81d5219.base44.app/functions/aiImage";
+const SEARCH_API_URL = "https://solas-c81d5219.base44.app/functions/searchImages";
 
 const contentTypeLabels: Record<ContentType, string> = {
   blog: "Blog Post",
@@ -47,6 +49,40 @@ function saveProjects(projects: Project[]) {
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
+
+// ─── Markdown utilities ────────────────────────────────
+function getImagesFromMarkdown(md: string): { alt: string; url: string }[] {
+  const images: { alt: string; url: string }[] = [];
+  const regex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  let match;
+  while ((match = regex.exec(md)) !== null) {
+    images.push({ alt: match[1], url: match[2] });
+  }
+  return images;
+}
+
+function replaceImageInMarkdown(md: string, index: number, newUrl: string, newAlt: string): string {
+  let count = 0;
+  return md.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, _alt, _url) => {
+    if (count === index) {
+      count++;
+      return `![${newAlt}](${newUrl})`;
+    }
+    count++;
+    return match;
+  });
+}
+
+
+function replaceTextBlockInMarkdown(md: string, oldText: string, newText: string): string {
+  return md.replace(oldText, newText);
+}
+
+// Configure marked for preview rendering
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+});
 
 // ─── App ───────────────────────────────────────────────
 export default function App() {
@@ -603,19 +639,36 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
 }) {
   const [content, setContent] = useState(project.content);
   const [title, setTitle] = useState(project.title);
-  const [selectedOutline, setSelectedOutline] = useState<string>(project.outline[0]?.id || "");
-  const [editorTab, setEditorTab] = useState("Editor");
-  const [imageTab, setImageTab] = useState("AI Images");
-  const [selectedTool, setSelectedTool] = useState("AI Chat");
+  const [editorMode, setEditorMode] = useState<"editor" | "preview">("preview");
+  const [rightPanel, setRightPanel] = useState<"chat" | "images" | "selection">("chat");
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [aiMessages, setAiMessages] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
   const [saved, setSaved] = useState(true);
   const editorRef = useRef<HTMLTextAreaElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Image generation state
   const [imagePrompt, setImagePrompt] = useState("");
   const [imageLoading, setImageLoading] = useState(false);
   const [generatedImages, setGeneratedImages] = useState<{ prompt: string; url: string }[]>([]);
+
+  // Image selection state
+  const [selectedImage, setSelectedImage] = useState<{ index: number; alt: string; url: string } | null>(null);
+  const [selectionTab, setSelectionTab] = useState<"ai" | "opensource">("ai");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<{ url: string; thumb: string; title: string; license: string; source: string }[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [altImages, setAltImages] = useState<string[]>([]);
+
+  // Text rewrite state
+  const [rewriteTarget, setRewriteTarget] = useState<string | null>(null);
+  const [rewriteInstruction, setRewriteInstruction] = useState("");
+  const [rewriteLoading, setRewriteLoading] = useState(false);
+
+  // Auto-fill images
+  const [autoFillLoading, setAutoFillLoading] = useState(false);
 
   // Auto-save
   useEffect(() => {
@@ -629,8 +682,8 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
   }, [title, content]); // eslint-disable-line
 
   const wordCount = content.split(/\s+/).filter(Boolean).length;
-  const charCount = content.length;
 
+  // ─── AI Chat ───
   const handleAiChat = async () => {
     if (!aiPrompt.trim() || aiLoading) return;
     const userMsg = aiPrompt.trim();
@@ -642,11 +695,21 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
       const res = await fetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: userMsg, topic: project.topic, type: project.type, tone: project.tone, length: "medium", mode: "chat" }),
+        body: JSON.stringify({
+          prompt: userMsg,
+          context: `Title: ${title}, Topic: ${project.topic}, Type: ${project.type}, Tone: ${project.tone}`,
+          mode: "chat",
+        }),
       });
       const data = await res.json();
       if (data.success) {
         setAiMessages((prev) => [...prev, { role: "assistant", text: data.content }]);
+        // If the response looks like content (has markdown headings), offer to insert
+        const hasMarkdown = data.content.match(/^#{1,6}\s/m) || data.content.length > 200;
+        if (hasMarkdown) {
+          setContent((prev) => prev + "\n\n" + data.content.replace(/^#\s+.+\n/, "").trim());
+          showToast("Content added to editor");
+        }
       } else {
         setAiMessages((prev) => [...prev, { role: "assistant", text: `Sorry, I couldn't generate a response: ${data.error}` }]);
       }
@@ -663,20 +726,24 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
     showToast("Content inserted into editor");
   };
 
-  const handleGenerateImage = async () => {
-    if (!imagePrompt.trim() || imageLoading) return;
-    const prompt = imagePrompt.trim();
-    setImagePrompt("");
+  // ─── AI Image Generation ───
+  const handleGenerateImage = async (prompt?: string) => {
+    const p = (prompt || imagePrompt).trim();
+    if (!p || imageLoading) return;
+    if (!prompt) setImagePrompt("");
     setImageLoading(true);
     try {
       const res = await fetch(IMAGE_API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt: p }),
       });
       const data = await res.json();
       if (data.success) {
-        setGeneratedImages((prev) => [{ prompt, url: data.image }, ...prev]);
+        setGeneratedImages((prev) => [{ prompt: p, url: data.image }, ...prev]);
+        if (selectedImage && prompt) {
+          setAltImages((prev) => [data.image, ...prev]);
+        }
         showToast("Image generated! ✨");
       } else {
         showToast(data.error || "Image generation failed");
@@ -694,6 +761,153 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
     showToast("Image inserted into editor");
   };
 
+  // ─── Image Selection ───
+  const handleImageClick = (index: number, alt: string, url: string) => {
+    setSelectedImage({ index, alt, url });
+    setSearchQuery(alt);
+    setAltImages([]);
+    setSelectionTab("ai");
+    setRightPanel("selection");
+    // Auto-search open source images
+    handleSearchImages(alt);
+    // Auto-generate an AI alternative
+    handleGenerateImage(alt);
+  };
+
+  const handleSearchImages = async (query: string) => {
+    if (!query.trim()) return;
+    setSearchLoading(true);
+    try {
+      const res = await fetch(SEARCH_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setSearchResults(data.images || []);
+      }
+    } catch {
+      showToast("Image search failed");
+    } finally {
+      setSearchLoading(false);
+    }
+  };
+
+  const handleReplaceImage = (newUrl: string, newAlt: string) => {
+    if (!selectedImage) return;
+    const updated = replaceImageInMarkdown(content, selectedImage.index, newUrl, newAlt);
+    setContent(updated);
+    setSelectedImage({ ...selectedImage, url: newUrl, alt: newAlt });
+    showToast("Image replaced");
+  };
+
+  // ─── Text Rewrite ───
+  const handleRewriteBlock = async () => {
+    if (!rewriteTarget || rewriteLoading) return;
+    setRewriteLoading(true);
+    try {
+      const instruction = rewriteInstruction.trim() || "Rewrite this to be clearer and more engaging:";
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "rewrite", text: rewriteTarget, instruction }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        const updated = replaceTextBlockInMarkdown(content, rewriteTarget, data.content);
+        setContent(updated);
+        showToast("Text rewritten ✨");
+      } else {
+        showToast(data.error || "Rewrite failed");
+      }
+    } catch {
+      showToast("Network error during rewrite");
+    } finally {
+      setRewriteLoading(false);
+      setRewriteTarget(null);
+      setRewriteInstruction("");
+    }
+  };
+
+  // ─── Auto-fill Images ───
+  const handleAutoFillImages = async () => {
+    setAutoFillLoading(true);
+    const headings = content.match(/^#{2,3}\s+.+$/gm) || [];
+    const images = getImagesFromMarkdown(content);
+    const existingCount = images.length;
+
+    for (let i = 0; i < headings.length; i++) {
+      const heading = headings[i].replace(/^#{2,3}\s+/, "");
+      // Skip if there's already an image near this heading
+      if (i < existingCount) continue;
+      try {
+        const res = await fetch(SEARCH_API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: heading }),
+        });
+        const data = await res.json();
+        if (data.success && data.images?.[0]) {
+          const img = data.images[0];
+          const imgMd = `\n\n![${heading}](${img.url})\n`;
+          // Insert after the heading line
+          const lines = content.split("\n");
+          for (let j = 0; j < lines.length; j++) {
+            if (lines[j].trim() === headings[i].trim()) {
+              lines.splice(j + 1, 0, imgMd.trim());
+              break;
+            }
+          }
+          setContent(lines.join("\n"));
+        }
+      } catch { /* skip on error */ }
+      // Small delay to avoid rate limiting
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    setAutoFillLoading(false);
+    showToast("Auto-filled images for content sections");
+  };
+
+  // ─── Preview click handlers ───
+  useEffect(() => {
+    if (editorMode !== "preview" || !previewRef.current) return;
+    const container = previewRef.current;
+
+    // Image click handlers
+    const imgs = container.querySelectorAll("img");
+    imgs.forEach((img, i) => {
+      img.style.cursor = "pointer";
+      img.classList.add("preview-img");
+      img.onclick = (e) => {
+        e.stopPropagation();
+        handleImageClick(i, img.alt || "image", img.src);
+      };
+    });
+
+    // Text block click handlers
+    const blocks = container.querySelectorAll("p, h1, h2, h3, h4, h5, h6, li");
+    blocks.forEach((block) => {
+      if (block.querySelector("img")) return; // Skip blocks with images
+      block.classList.add("preview-text-block");
+      (block as HTMLElement).onclick = (e) => {
+        e.stopPropagation();
+        const text = block.textContent || "";
+        if (text.trim().length > 5) {
+          setRewriteTarget(text.trim());
+        }
+      };
+    });
+
+    return () => {
+      imgs.forEach((img) => { img.onclick = null; });
+    };
+  }, [content, editorMode]); // eslint-disable-line
+
+  // Render preview HTML
+  const previewHtml = editorMode === "preview" ? marked.parse(content) as string : "";
+
+  // Apply formatting in editor
   const applyFormat = (format: string) => {
     const el = editorRef.current;
     if (!el) return;
@@ -704,13 +918,10 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
     switch (format) {
       case "bold": wrapped = `**${selected}**`; break;
       case "italic": wrapped = `*${selected}*`; break;
-      case "underline": wrapped = `__${selected}__`; break;
-      case "strike": wrapped = `~~${selected}~~`; break;
       case "h1": wrapped = `# ${selected}`; break;
       case "h2": wrapped = `## ${selected}`; break;
       case "h3": wrapped = `### ${selected}`; break;
       case "ul": wrapped = selected.split("\n").map((l) => `- ${l}`).join("\n"); break;
-      case "ol": wrapped = selected.split("\n").map((l, i) => `${i + 1}. ${l}`).join("\n"); break;
       case "link": wrapped = `[${selected}](url)`; break;
       default: break;
     }
@@ -734,304 +945,355 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
           <div className="breadcrumbs">
             <button onClick={onBack} style={{ background: "none", border: "none", color: "var(--muted-fg)", cursor: "pointer", fontSize: "inherit" }}>Projects</button>
             <ChevronRightIcon />
-            <strong>{title}</strong>
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Untitled..."
+              className="title-input"
+              style={{ fontWeight: 700, fontSize: "1rem" }}
+            />
           </div>
         </div>
         <div className="topbar-actions">
-          <div className="saved-state">
-            {saved ? <><CheckCircleIcon /><span>Saved</span></> : <><SpinnerIcon /><span>Saving...</span></>}
-          </div>
-          <button type="button" className="menu-button" onClick={onExport}>
+          <span style={{ fontSize: ".8rem", color: "var(--muted-fg)" }}>
+            {saved ? "✓ Saved" : "Saving..."} · {wordCount} words
+          </span>
+          <button type="button" className="ghost-button" onClick={() => setEditorMode(editorMode === "editor" ? "preview" : "editor")}>
+            {editorMode === "editor" ? <><EyeIcon /> <span>Preview</span></> : <><PencilIcon /> <span>Edit</span></>}
+          </button>
+          <button type="button" className="ghost-button" onClick={onExport}>
+            <DownloadIcon />
             <span>Export</span>
           </button>
-          <button type="button" className="publish-button" onClick={onPublish} disabled={project.status === "published"}>
+          <button type="button" className="primary-action" onClick={onPublish}>
             <RocketIcon />
-            <span>{project.status === "published" ? "Published" : "Publish"}</span>
+            <span>Publish</span>
           </button>
         </div>
       </header>
 
-      {/* Workspace */}
-      <section className="workspace-grid">
-        {/* Outline */}
-        <aside className="outline-panel panel">
-          <div className="panel-header">
-            <h2>Document Outline</h2>
-          </div>
-          <div className="outline-list">
-            {project.outline.map((section) => (
-              <button
-                key={section.id}
-                type="button"
-                className={`outline-item ${section.id === selectedOutline ? "is-active" : ""}`}
-                onClick={() => setSelectedOutline(section.id)}
-              >
-                <span className="outline-status" aria-hidden="true" />
-                <span className="outline-label">{section.title}</span>
+      {/* Editor / Preview area */}
+      <section className="editor-main" style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        {editorMode === "editor" ? (
+          <>
+            {/* Formatting toolbar */}
+            <div className="format-toolbar" style={{ display: "flex", gap: ".25rem", padding: ".5rem 1rem", borderBottom: "1px solid var(--border)", background: "var(--panel-bg)" }}>
+              {[
+                { f: "bold", label: "B" },
+                { f: "italic", label: "I" },
+                { f: "h1", label: "H1" },
+                { f: "h2", label: "H2" },
+                { f: "h3", label: "H3" },
+                { f: "ul", label: "• List" },
+                { f: "link", label: "Link" },
+              ].map(({ f, label }) => (
+                <button key={f} type="button" className="format-btn" onClick={() => applyFormat(f)} style={{
+                  padding: ".3rem .6rem", background: "none", border: "1px solid var(--border)", borderRadius: "6px",
+                  color: "var(--fg)", fontSize: ".8rem", cursor: "pointer", fontWeight: 600,
+                }}>{label}</button>
+              ))}
+              <div style={{ flex: 1 }} />
+              <button type="button" className="format-btn" onClick={handleAutoFillImages} disabled={autoFillLoading} style={{
+                padding: ".3rem .8rem", background: "var(--accent)", border: "none", borderRadius: "6px",
+                color: "white", fontSize: ".8rem", cursor: "pointer", fontWeight: 600,
+              }}>
+                {autoFillLoading ? "Filling..." : "🖼 Auto-Fill Images"}
               </button>
-            ))}
+            </div>
+            <textarea
+              ref={editorRef}
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              placeholder="Start writing or use the AI Chat to generate content..."
+              style={{
+                flex: 1, width: "100%", padding: "1.5rem", background: "transparent",
+                border: "none", color: "var(--fg)", fontSize: ".95rem", lineHeight: 1.8,
+                fontFamily: "monospace", resize: "none", outline: "none",
+              }}
+            />
+          </>
+        ) : (
+          <div className="preview-container" ref={previewRef} style={{ flex: 1, overflow: "auto", padding: "2rem 3rem" }}>
+            <div dangerouslySetInnerHTML={{ __html: previewHtml }} />
           </div>
-          <button
-            type="button"
-            className="add-section-button"
-            onClick={() => {
-              const newSection = { id: uid(), title: "New Section", summary: "" };
-              onUpdate({ outline: [...project.outline, newSection] });
-              showToast("Section added");
-            }}
-          >
-            <PlusIcon /><span>Add Section</span>
-          </button>
-        </aside>
+        )}
 
-        {/* Editor */}
-        <section className="editor-panel panel">
-          <div className="panel-tabs">
-            {["Editor", "Outline", "SEO"].map((tab) => (
-              <button
-                key={tab}
-                type="button"
-                className={`tab-button ${tab === editorTab ? "is-active" : ""}`}
-                onClick={() => setEditorTab(tab)}
-              >
-                {tab}
+        {/* Rewrite floating panel */}
+        {rewriteTarget && (
+          <div className="rewrite-panel" style={{
+            position: "fixed", bottom: "2rem", right: "2rem", zIndex: 100,
+            background: "var(--card-bg)", border: "1px solid var(--border)", borderRadius: "12px",
+            padding: "1rem", boxShadow: "0 8px 24px rgba(0,0,0,.2)", maxWidth: "400px",
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: ".5rem" }}>
+              <strong style={{ fontSize: ".9rem" }}>✏️ Rewrite Block</strong>
+              <button onClick={() => { setRewriteTarget(null); setRewriteInstruction(""); }} style={{ background: "none", border: "none", color: "var(--muted-fg)", cursor: "pointer", fontSize: "1.2rem" }}>✕</button>
+            </div>
+            <div style={{ fontSize: ".8rem", color: "var(--muted-fg)", marginBottom: ".5rem", maxHeight: "80px", overflow: "hidden", border: "1px solid var(--border)", borderRadius: "6px", padding: ".5rem", background: "var(--panel-bg)" }}>
+              {rewriteTarget.slice(0, 200)}{rewriteTarget.length > 200 ? "..." : ""}
+            </div>
+            <input
+              type="text"
+              value={rewriteInstruction}
+              onChange={(e) => setRewriteInstruction(e.target.value)}
+              placeholder="How should I rewrite it? (optional)"
+              style={{
+                width: "100%", padding: ".5rem", marginBottom: ".5rem", background: "var(--panel-bg)",
+                border: "1px solid var(--border)", borderRadius: "6px", color: "var(--fg)", fontSize: ".85rem", outline: "none",
+              }}
+            />
+            <div style={{ display: "flex", gap: ".5rem" }}>
+              <button type="button" className="primary-action" style={{ flex: 1, justifyContent: "center" }} onClick={handleRewriteBlock} disabled={rewriteLoading}>
+                {rewriteLoading ? <><SpinnerIcon /><span>Rewriting...</span></> : <><RefreshIcon /><span>Rewrite</span></>}
               </button>
-            ))}
+            </div>
           </div>
+        )}
+      </section>
 
-          {editorTab === "Editor" ? (
-            <>
-              {/* Title input */}
+      {/* Right panel: Chat / Images / Selection */}
+      <aside className="image-panel panel" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+        <div className="panel-tabs">
+          <button type="button" className={`tab-button ${rightPanel === "chat" ? "is-active" : ""}`} onClick={() => setRightPanel("chat")}>AI Chat</button>
+          <button type="button" className={`tab-button ${rightPanel === "images" ? "is-active" : ""}`} onClick={() => setRightPanel("images")}>AI Images</button>
+          {selectedImage && (
+            <button type="button" className={`tab-button ${rightPanel === "selection" ? "is-active" : ""}`} onClick={() => setRightPanel("selection")}>Selection</button>
+          )}
+        </div>
+
+        {/* AI Chat */}
+        {rightPanel === "chat" && (
+          <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "1rem" }}>
+            <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: ".75rem", marginBottom: ".75rem" }}>
+              {aiMessages.length === 0 && (
+                <div style={{ textAlign: "center", color: "var(--muted-fg)", padding: "2rem 1rem" }}>
+                  <RobotIcon />
+                  <p style={{ marginTop: ".5rem", fontSize: ".85rem" }}>Discuss your project with AI. Content will appear in the preview automatically.</p>
+                </div>
+              )}
+              {aiMessages.map((msg, i) => (
+                <div key={i} className={`ai-msg ${msg.role}`}>
+                  <div className="ai-msg-text">{msg.text}</div>
+                  {msg.role === "assistant" && (
+                    <button className="ai-msg-action" onClick={() => insertAiContent(msg.text)}>
+                      <PlusIcon /> Insert into editor
+                    </button>
+                  )}
+                </div>
+              ))}
+              {aiLoading && (
+                <div className="ai-msg assistant">
+                  <div style={{ display: "flex", alignItems: "center", gap: ".5rem" }}>
+                    <SpinnerIcon /><span style={{ fontSize: ".85rem", color: "var(--muted-fg)" }}>AI is thinking...</span>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div style={{ display: "flex", gap: ".5rem" }}>
               <input
                 type="text"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                className="title-input"
-                placeholder="Untitled..."
+                value={aiPrompt}
+                onChange={(e) => setAiPrompt(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleAiChat(); }}
+                placeholder="Ask AI to write..."
                 style={{
-                  width: "100%", border: "none", background: "transparent",
-                  fontSize: "1.5rem", fontWeight: 700, padding: "1rem 1.5rem .5rem",
-                  color: "var(--fg)", outline: "none"
+                  flex: 1, padding: ".6rem .8rem", background: "var(--panel-bg)",
+                  border: "1px solid var(--border)", borderRadius: "8px",
+                  color: "var(--fg)", fontSize: ".85rem", outline: "none"
                 }}
               />
+              <button className="primary-action" style={{ padding: ".6rem .8rem" }} onClick={handleAiChat} disabled={aiLoading}>
+                <SparklesIcon />
+              </button>
+            </div>
+          </div>
+        )}
 
-              {/* Toolbar */}
-              <div className="toolbar" aria-label="Text formatting">
-                <button type="button" className="toolbar-button is-strong" onClick={() => applyFormat("bold")} title="Bold"><BoldIcon /></button>
-                <button type="button" className="toolbar-button" onClick={() => applyFormat("italic")} title="Italic"><ItalicIcon /></button>
-                <button type="button" className="toolbar-button" onClick={() => applyFormat("strike")} title="Strikethrough"><StrikeIcon /></button>
-                <div className="divider" />
-                <button type="button" className="toolbar-button" onClick={() => applyFormat("h1")} title="Heading 1"><span className="format-glyph">H1</span></button>
-                <button type="button" className="toolbar-button" onClick={() => applyFormat("h2")} title="Heading 2"><span className="format-glyph">H2</span></button>
-                <button type="button" className="toolbar-button" onClick={() => applyFormat("h3")} title="Heading 3"><span className="format-glyph">H3</span></button>
-                <div className="divider" />
-                <button type="button" className="toolbar-button" onClick={() => applyFormat("ul")} title="Bullet list"><ListBulletsIcon /></button>
-                <button type="button" className="toolbar-button" onClick={() => applyFormat("ol")} title="Numbered list"><ListIcon /></button>
-                <div className="divider" />
-                <button type="button" className="toolbar-button" onClick={() => applyFormat("link")} title="Insert link"><LinkIcon /></button>
-              </div>
-
-              {/* Textarea editor */}
-              <textarea
-                ref={editorRef}
-                value={content}
-                onChange={(e) => setContent(e.target.value)}
-                className="content-editor"
-                placeholder="Start writing or use the AI Chat tool to generate content..."
+        {/* AI Images */}
+        {rightPanel === "images" && (
+          <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "1rem" }}>
+            <div style={{ display: "flex", gap: ".5rem", marginBottom: ".75rem" }}>
+              <input
+                type="text"
+                value={imagePrompt}
+                onChange={(e) => setImagePrompt(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleGenerateImage(); }}
+                placeholder="Describe an image..."
                 style={{
-                  flex: 1, width: "100%", border: "none", background: "transparent",
-                  padding: "1.5rem", color: "var(--fg)", fontSize: ".95rem",
-                  lineHeight: 1.8, resize: "none", outline: "none", fontFamily: "inherit",
-                  minHeight: "400px"
+                  flex: 1, padding: ".6rem .8rem", background: "var(--panel-bg)",
+                  border: "1px solid var(--border)", borderRadius: "8px",
+                  color: "var(--fg)", fontSize: ".85rem", outline: "none"
                 }}
               />
-
-              {/* Footer */}
-              <footer className="article-footer">
-                <span>Words: {wordCount.toLocaleString()}</span>
-                <span>Characters: {charCount.toLocaleString()}</span>
-                <span className={`status-badge ${project.status}`}>{project.status}</span>
-                <span>{saved ? "Saved" : "Saving..."}</span>
-              </footer>
-            </>
-          ) : editorTab === "Outline" ? (
-            <div style={{ padding: "1.5rem" }}>
-              {project.outline.map((s, i) => (
-                <div key={s.id} style={{ padding: ".75rem 0", borderBottom: "1px solid var(--border)" }}>
-                  <strong>{i + 1}. {s.title}</strong>
-                  <p style={{ color: "var(--muted-fg)", fontSize: ".85rem", marginTop: ".25rem" }}>{s.summary}</p>
+              <button className="primary-action" style={{ padding: ".6rem .8rem" }} onClick={() => handleGenerateImage()} disabled={imageLoading}>
+                {imageLoading ? <SpinnerIcon /> : <ImageIcon />}
+              </button>
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: ".75rem" }}>
+              {imageLoading && generatedImages.length === 0 && (
+                <div style={{ textAlign: "center", padding: "2rem 1rem" }}>
+                  <SpinnerIcon />
+                  <p style={{ color: "var(--muted-fg)", fontSize: ".85rem", marginTop: ".5rem" }}>Generating image with FLUX AI...</p>
+                </div>
+              )}
+              {generatedImages.length === 0 && !imageLoading && (
+                <div style={{ textAlign: "center", padding: "2rem 1rem" }}>
+                  <ImageIcon />
+                  <p style={{ color: "var(--muted-fg)", fontSize: ".85rem", marginTop: ".5rem" }}>Describe an image and generate it with FLUX AI.</p>
+                </div>
+              )}
+              {generatedImages.map((img, i) => (
+                <div key={i} style={{ borderRadius: "8px", overflow: "hidden", border: "1px solid var(--border)" }}>
+                  <img src={img.url} alt={img.prompt} style={{ width: "100%", display: "block" }} />
+                  <div style={{ padding: ".5rem .75rem", background: "var(--panel-bg)" }}>
+                    <p style={{ fontSize: ".75rem", color: "var(--muted-fg)", margin: "0 0 .4rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{img.prompt}</p>
+                    <button
+                      className="ai-msg-action"
+                      style={{ width: "100%", justifyContent: "center" }}
+                      onClick={() => insertImage(img.url, img.prompt)}
+                    >
+                      <PlusIcon /> Insert into editor
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
-          ) : (
-            <div style={{ padding: "1.5rem" }}>
-              <h3 style={{ fontWeight: 600, marginBottom: "1rem" }}>SEO Analysis</h3>
-              <div style={{ display: "grid", gap: ".75rem" }}>
-                <SeoRow label="Word Count" value={wordCount.toString()} good={wordCount > 300} />
-                <SeoRow label="Title Length" value={`${title.length} chars`} good={title.length >= 30 && title.length <= 60} />
-                <SeoRow label="Headings" value={`${(content.match(/^##\s/gm) || []).length} sections`} good={(content.match(/^##\s/gm) || []).length >= 2} />
-                <SeoRow label="Readability" value="Grade 8" good={true} />
-                <SeoRow label="Keyword Density" value="—" good={null} />
-              </div>
-            </div>
-          )}
-        </section>
-
-        {/* Right panel: AI Chat / Images */}
-        <aside className="image-panel panel">
-          <div className="panel-tabs">
-            {["AI Chat", "AI Images", "Uploads"].map((tab) => (
-              <button
-                key={tab}
-                type="button"
-                className={`tab-button ${tab === imageTab ? "is-active" : ""}`}
-                onClick={() => setImageTab(tab)}
-              >
-                {tab}
-              </button>
-            ))}
           </div>
+        )}
 
-          {imageTab === "AI Chat" ? (
-            <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "1rem" }}>
-              <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: ".75rem", marginBottom: ".75rem" }}>
-                {aiMessages.length === 0 && (
-                  <div style={{ textAlign: "center", color: "var(--muted-fg)", padding: "2rem 1rem" }}>
-                    <RobotIcon />
-                    <p style={{ marginTop: ".5rem", fontSize: ".85rem" }}>Ask the AI to write, expand, or rewrite content for this project.</p>
-                  </div>
-                )}
-                {aiMessages.map((msg, i) => (
-                  <div key={i} className={`ai-msg ${msg.role}`}>
-                    <div className="ai-msg-text">{msg.text}</div>
-                    {msg.role === "assistant" && (
-                      <button className="ai-msg-action" onClick={() => insertAiContent(msg.text)}>
-                        <PlusIcon /> Insert into editor
-                      </button>
-                    )}
-                  </div>
-                ))}
-                {aiLoading && (
-                  <div className="ai-msg assistant">
-                    <div style={{ display: "flex", alignItems: "center", gap: ".5rem" }}>
-                      <SpinnerIcon /><span style={{ fontSize: ".85rem", color: "var(--muted-fg)" }}>AI is thinking...</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-              <div style={{ display: "flex", gap: ".5rem" }}>
-                <input
-                  type="text"
-                  value={aiPrompt}
-                  onChange={(e) => setAiPrompt(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter") handleAiChat(); }}
-                  placeholder="Ask AI to write..."
-                  style={{
-                    flex: 1, padding: ".6rem .8rem", background: "var(--panel-bg)",
-                    border: "1px solid var(--border)", borderRadius: "8px",
-                    color: "var(--fg)", fontSize: ".85rem", outline: "none"
-                  }}
-                />
-                <button className="primary-action" style={{ padding: ".6rem .8rem" }} onClick={handleAiChat} disabled={aiLoading}>
-                  <SparklesIcon />
-                </button>
+        {/* Image Selection */}
+        {rightPanel === "selection" && selectedImage && (
+          <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "1rem" }}>
+            {/* Current image */}
+            <div style={{ borderRadius: "8px", overflow: "hidden", border: "1px solid var(--border)", marginBottom: ".75rem" }}>
+              <img src={selectedImage.url} alt={selectedImage.alt} style={{ width: "100%", display: "block" }} />
+              <div style={{ padding: ".4rem .75rem", background: "var(--panel-bg)" }}>
+                <p style={{ fontSize: ".75rem", color: "var(--muted-fg)", margin: 0 }}>Current image · {selectedImage.alt}</p>
               </div>
             </div>
-          ) : imageTab === "AI Images" ? (
-            <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "1rem" }}>
-              <div style={{ display: "flex", gap: ".5rem", marginBottom: ".75rem" }}>
-                <input
-                  type="text"
-                  value={imagePrompt}
-                  onChange={(e) => setImagePrompt(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter") handleGenerateImage(); }}
-                  placeholder="Describe an image..."
-                  style={{
-                    flex: 1, padding: ".6rem .8rem", background: "var(--panel-bg)",
-                    border: "1px solid var(--border)", borderRadius: "8px",
-                    color: "var(--fg)", fontSize: ".85rem", outline: "none"
-                  }}
-                />
-                <button className="primary-action" style={{ padding: ".6rem .8rem" }} onClick={handleGenerateImage} disabled={imageLoading}>
-                  {imageLoading ? <SpinnerIcon /> : <ImageIcon />}
-                </button>
-              </div>
-              <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: ".75rem" }}>
-                {imageLoading && generatedImages.length === 0 && (
-                  <div style={{ textAlign: "center", padding: "2rem 1rem" }}>
-                    <SpinnerIcon />
-                    <p style={{ color: "var(--muted-fg)", fontSize: ".85rem", marginTop: ".5rem" }}>Generating image with FLUX AI...</p>
-                  </div>
-                )}
-                {generatedImages.length === 0 && !imageLoading && (
-                  <div style={{ textAlign: "center", padding: "2rem 1rem" }}>
-                    <ImageIcon />
-                    <p style={{ color: "var(--muted-fg)", fontSize: ".85rem", marginTop: ".5rem" }}>Describe an image and generate it with FLUX AI.</p>
-                  </div>
-                )}
-                {generatedImages.map((img, i) => (
-                  <div key={i} style={{ borderRadius: "8px", overflow: "hidden", border: "1px solid var(--border)" }}>
-                    <img src={img.url} alt={img.prompt} style={{ width: "100%", display: "block" }} />
-                    <div style={{ padding: ".5rem .75rem", background: "var(--panel-bg)" }}>
-                      <p style={{ fontSize: ".75rem", color: "var(--muted-fg)", margin: "0 0 .4rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{img.prompt}</p>
-                      <button
-                        className="ai-msg-action"
-                        style={{ width: "100%", justifyContent: "center" }}
-                        onClick={() => insertImage(img.url, img.prompt)}
-                      >
-                        <PlusIcon /> Insert into editor
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <div style={{ padding: "1.5rem", textAlign: "center" }}>
-              <ImageIcon />
-              <p style={{ color: "var(--muted-fg)", fontSize: ".85rem", marginTop: ".5rem" }}>Upload images to use in your content.</p>
-            </div>
-          )}
-        </aside>
 
-        {/* Tool rail */}
-        <aside className="tool-rail" aria-label="Workspace tools">
-          {[
-            { label: "AI Chat", icon: <RobotIcon /> },
-            { label: "Images", icon: <ImageIcon /> },
-            { label: "Links", icon: <LinkIcon /> },
-            { label: "Format", icon: <TextIcon /> },
-            { label: "SEO Score", icon: <MeterIcon /> },
-            { label: "Notes", icon: <NoteIcon /> },
-            { label: "History", icon: <HistoryIcon /> },
-          ].map((tool) => (
-            <button
-              key={tool.label}
-              type="button"
-              className={`rail-button ${tool.label === selectedTool ? "is-active" : ""}`}
-              onClick={() => { setSelectedTool(tool.label); showToast(`${tool.label} tool`); }}
-            >
-              <span className="rail-icon">{tool.icon}</span>
-              <span className="rail-label">{tool.label}</span>
-            </button>
-          ))}
-          <button type="button" className="floating-action" aria-label="Open quick actions" onClick={() => setImageTab("AI Chat")}>
-            <SparklesIcon />
+            {/* Selection tabs */}
+            <div style={{ display: "flex", gap: ".25rem", marginBottom: ".75rem" }}>
+              <button
+                type="button"
+                style={{
+                  flex: 1, padding: ".4rem", borderRadius: "6px", fontSize: ".8rem", fontWeight: 600, cursor: "pointer",
+                  background: selectionTab === "ai" ? "var(--accent)" : "var(--panel-bg)",
+                  border: "1px solid var(--border)", color: selectionTab === "ai" ? "white" : "var(--fg)",
+                }}
+                onClick={() => setSelectionTab("ai")}
+              >AI Generated</button>
+              <button
+                type="button"
+                style={{
+                  flex: 1, padding: ".4rem", borderRadius: "6px", fontSize: ".8rem", fontWeight: 600, cursor: "pointer",
+                  background: selectionTab === "opensource" ? "var(--accent)" : "var(--panel-bg)",
+                  border: "1px solid var(--border)", color: selectionTab === "opensource" ? "white" : "var(--fg)",
+                }}
+                onClick={() => setSelectionTab("opensource")}
+              >Open Source</button>
+            </div>
+
+            <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: ".5rem" }}>
+              {selectionTab === "ai" ? (
+                <>
+                  <button
+                    className="primary-action"
+                    style={{ justifyContent: "center", marginBottom: ".5rem" }}
+                    onClick={() => handleGenerateImage(selectedImage.alt)}
+                    disabled={imageLoading}
+                  >
+                    {imageLoading ? <><SpinnerIcon /><span>Generating...</span></> : <><SparklesIcon /><span>Regenerate with FLUX</span></>}
+                  </button>
+                  {altImages.map((url, i) => (
+                    <div key={i} style={{ borderRadius: "8px", overflow: "hidden", border: "1px solid var(--border)", cursor: "pointer" }}
+                      onClick={() => handleReplaceImage(url, selectedImage.alt)}
+                    >
+                      <img src={url} alt="AI alternative" style={{ width: "100%", display: "block" }} />
+                      <div style={{ padding: ".3rem .6rem", background: "var(--panel-bg)", textAlign: "center" }}>
+                        <span style={{ fontSize: ".75rem", color: "var(--muted-fg)" }}>Click to use this</span>
+                      </div>
+                    </div>
+                  ))}
+                </>
+              ) : (
+                <>
+                  <div style={{ display: "flex", gap: ".5rem", marginBottom: ".5rem" }}>
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") handleSearchImages(searchQuery); }}
+                      placeholder="Search open source..."
+                      style={{
+                        flex: 1, padding: ".4rem .6rem", background: "var(--panel-bg)",
+                        border: "1px solid var(--border)", borderRadius: "6px",
+                        color: "var(--fg)", fontSize: ".8rem", outline: "none",
+                      }}
+                    />
+                    <button
+                      className="ghost-button"
+                      style={{ padding: ".4rem .6rem", fontSize: ".8rem" }}
+                      onClick={() => handleSearchImages(searchQuery)}
+                      disabled={searchLoading}
+                    >
+                      {searchLoading ? "..." : "Search"}
+                    </button>
+                  </div>
+                  {searchResults.map((img, i) => (
+                    <div key={i} style={{ borderRadius: "8px", overflow: "hidden", border: "1px solid var(--border)", cursor: "pointer" }}
+                      onClick={() => handleReplaceImage(img.url, img.title)}
+                    >
+                      <img src={img.url} alt={img.title} style={{ width: "100%", display: "block", maxHeight: "200px", objectFit: "cover" }} />
+                      <div style={{ padding: ".3rem .6rem", background: "var(--panel-bg)" }}>
+                        <p style={{ fontSize: ".7rem", color: "var(--muted-fg)", margin: 0 }}>{img.license} · {img.source}</p>
+                      </div>
+                    </div>
+                  ))}
+                  {!searchLoading && searchResults.length === 0 && (
+                    <p style={{ textAlign: "center", color: "var(--muted-fg)", fontSize: ".85rem", padding: "1rem" }}>No results yet. Try searching above.</p>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </aside>
+
+      {/* Tool rail */}
+      <aside className="tool-rail" aria-label="Workspace tools">
+        {[
+          { label: "AI Chat", icon: <RobotIcon />, tool: "chat" },
+          { label: "Images", icon: <ImageIcon />, tool: "images" },
+          { label: "Text", icon: <TextIcon />, tool: "text" },
+          { label: "SEO", icon: <MeterIcon />, tool: "seo" },
+          { label: "Notes", icon: <NoteIcon />, tool: "notes" },
+        ].map(({ label, icon, tool }) => (
+          <button
+            key={label}
+            type="button"
+            className={`tool-rail-btn ${rightPanel === tool || (tool === "chat" && rightPanel === "selection") ? "is-active" : ""}`}
+            aria-label={label}
+            onClick={() => {
+              if (tool === "chat") setRightPanel("chat");
+              else if (tool === "images") setRightPanel("images");
+              else showToast(`${label} tools coming soon`);
+            }}
+          >
+            {icon}
           </button>
-        </aside>
-      </section>
+        ))}
+      </aside>
+
+      {/* Floating quick action */}
+      <button type="button" className="floating-action" aria-label="Open quick actions" onClick={() => setRightPanel("chat")}>
+        <SparklesIcon />
+      </button>
     </>
   );
 }
 
-function SeoRow({ label, value, good }: { label: string; value: string; good: boolean | null }) {
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: ".6rem .8rem", background: "var(--panel-bg)", borderRadius: "8px" }}>
-      <span style={{ fontSize: ".85rem" }}>{label}</span>
-      <span style={{ fontSize: ".85rem", fontWeight: 600, color: good === true ? "#10b981" : good === false ? "#f59e0b" : "var(--muted-fg)" }}>{value}</span>
-    </div>
-  );
-}
+
 
 // ─── New Project Modal ─────────────────────────────────
 function NewProjectModal({ onClose, onCreate }: {
@@ -1292,6 +1554,15 @@ function ImageLibraryView({ showToast }: { showToast: (msg: string) => void }) {
 }
 
 // ─── Icon Components ──────────────────────────────────
+function EyeIcon() {
+  return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" stroke="currentColor" strokeWidth="1.8" /><circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.8" /></svg>;
+}
+
+function DownloadIcon() {
+  return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4v12m0 0-4-4m4 4 4-4M4 20h16" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>;
+}
+
+
 function MarkIcon() {
   return (
     <svg viewBox="0 0 44 44" fill="none" aria-hidden="true">
@@ -1354,10 +1625,6 @@ function RobotIcon() {
   return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="6" width="14" height="11" rx="3" stroke="currentColor" strokeWidth="1.8" /><path d="M12 3.5v2.5M8.5 11h.1M15.5 11h.1" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /><path d="M8 15.5c1 .8 2.3 1.2 4 1.2s3-.4 4-1.2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /></svg>;
 }
 
-function LinkIcon() {
-  return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9.5 14.5 8 16a4 4 0 0 1-5.7-5.7l2.3-2.3A4 4 0 0 1 10 8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /><path d="M14.5 9.5 16 8a4 4 0 0 1 5.7 5.7l-2.3 2.3A4 4 0 0 1 14 16" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /><path d="M9 12h6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /></svg>;
-}
-
 function TextIcon() {
   return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 7h14M9 7v10M15 7v10" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /></svg>;
 }
@@ -1370,32 +1637,12 @@ function NoteIcon() {
   return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 4.5h9l3 3V19a1.5 1.5 0 0 1-1.5 1.5H6A1.5 1.5 0 0 1 4.5 19V6A1.5 1.5 0 0 1 6 4.5Z" stroke="currentColor" strokeWidth="1.8" /><path d="M15 4.5V8h3.5M7 11h10M7 14h10M7 17h6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /></svg>;
 }
 
-function HistoryIcon() {
-  return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6.5 7.5 4.8 9.2 6.5 11" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /><path d="M5 9h7a6 6 0 1 1-4.2 10.3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /><path d="M12 8v4l3 2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>;
-}
-
-function CheckCircleIcon() {
-  return <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="8" stroke="currentColor" strokeWidth="1.5" /><path d="m6.8 10.3 1.9 1.9 4.6-5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>;
-}
-
 function ChevronDownIcon() {
   return <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m5 8 5 5 5-5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>;
 }
 
 function ChevronRightIcon() {
   return <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m8 5 4 5-4 5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>;
-}
-
-function BoldIcon() { return <span className="format-glyph">B</span>; }
-function ItalicIcon() { return <span className="format-glyph italic">I</span>; }
-function StrikeIcon() { return <span className="format-glyph strike">S</span>; }
-
-function ListIcon() {
-  return <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M7 5h10M7 10h10M7 15h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /><circle cx="3.5" cy="5" r="0.9" fill="currentColor" /><circle cx="3.5" cy="10" r="0.9" fill="currentColor" /><circle cx="3.5" cy="15" r="0.9" fill="currentColor" /></svg>;
-}
-
-function ListBulletsIcon() {
-  return <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M7 5h10M7 10h10M7 15h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /><circle cx="3.5" cy="5" r="1.5" fill="none" stroke="currentColor" strokeWidth="1.2" /><circle cx="3.5" cy="10" r="1.5" fill="none" stroke="currentColor" strokeWidth="1.2" /><circle cx="3.5" cy="15" r="1.5" fill="none" stroke="currentColor" strokeWidth="1.2" /></svg>;
 }
 
 function TrashIcon() {
