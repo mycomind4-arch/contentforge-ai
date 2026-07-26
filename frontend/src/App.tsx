@@ -935,9 +935,9 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
   };
 
   return (
-    <>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
       {/* Topbar */}
-      <header className="topbar">
+      <header className="topbar" style={{ flexShrink: 0 }}>
         <div className="topbar-left">
           <button type="button" className="menu-toggle" aria-label="Toggle sidebar" onClick={() => {}}>
             <MenuIcon />
@@ -972,8 +972,10 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
         </div>
       </header>
 
+      {/* Main editor area + right panel + tool rail */}
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 372px 72px", gap: "14px", flex: 1, overflow: "hidden", padding: "0 14px 14px 0" }}>
       {/* Editor / Preview area */}
-      <section className="editor-main" style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <section className="editor-main" style={{ display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
         {editorMode === "editor" ? (
           <>
             {/* Formatting toolbar */}
@@ -1284,12 +1286,13 @@ function EditorView({ project, onUpdate, onBack, onPublish, onExport, showToast 
           </button>
         ))}
       </aside>
+      </div>
 
       {/* Floating quick action */}
       <button type="button" className="floating-action" aria-label="Open quick actions" onClick={() => setRightPanel("chat")}>
         <SparklesIcon />
       </button>
-    </>
+    </div>
   );
 }
 
